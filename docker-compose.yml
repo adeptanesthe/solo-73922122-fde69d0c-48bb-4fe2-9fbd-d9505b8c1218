@@ -1,0 +1,8 @@
+services:
+  fabric-sorting-api:
+    build: .
+    image: fabric-sorting-api:1.0.0
+    container_name: fabric-sorting-api
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
