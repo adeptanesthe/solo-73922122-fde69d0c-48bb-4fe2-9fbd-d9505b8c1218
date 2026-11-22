@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -71,6 +72,7 @@ class Batch:
     baseline: dict[int, engine.Recommendation] = field(default_factory=dict)
     last_review: dict | None = None
     review_fingerprint: tuple | None = None
+    lab_queues: dict[tuple[int, int], dict] = field(default_factory=dict)
 
     def sample_index(self) -> dict[int, int]:
         return {sample_id: index for index, sample_id in enumerate(self.sample_ids)}
@@ -126,6 +128,19 @@ class BatchStore:
             )
         except engine.ComputationError as exc:
             raise ComputationFailed(str(exc)) from exc
+
+    @staticmethod
+    def _invalidate_derived(batch: Batch) -> None:
+        """Drop state computed from the previous label set and version.
+
+        Called inside the write lock immediately after a successful label
+        change, so the queue cache can never outlive the version it was
+        computed for.
+        """
+
+        batch.last_review = None
+        batch.review_fingerprint = None
+        batch.lab_queues.clear()
 
     def create(self, payload: BatchCreateIn) -> dict:
         batch_id = payload.batch_id or f"batch-{uuid.uuid4().hex[:12]}"
@@ -195,6 +210,7 @@ class BatchStore:
                 batch.baseline = previous_baseline
                 batch.version = previous_version
                 raise
+            self._invalidate_derived(batch)
             batch.version += 1
             return batch.snapshot()
 
@@ -217,6 +233,7 @@ class BatchStore:
                 batch.baseline = previous_baseline
                 batch.version = previous_version
                 raise
+            self._invalidate_derived(batch)
             batch.version += 1
             return batch.snapshot()
 
@@ -252,6 +269,65 @@ class BatchStore:
             batch.last_review = result
             batch.review_fingerprint = fingerprint
             return result
+
+    def request_lab_queue(self, batch_id: str, version: int, quota: int) -> dict:
+        """Return the proactive lab queue for this exact batch state.
+
+        The queue is bound to ``(version, quota)``.  A retry with the same
+        pair returns the stored queue verbatim (the full operation, from the
+        version check through caching, happens under the store lock, so
+        concurrent retries cannot observe or create divergent queues).
+        Any successful label change clears the cache and bumps the version,
+        which makes a request carrying the old version fail with 409 rather
+        than silently recomputing against the new label set.
+        """
+
+        with self._lock:
+            batch = self.get(batch_id)
+            self._check_version(batch, version)
+            key = (version, quota)
+            cached = batch.lab_queues.get(key)
+            if cached is not None:
+                return copy.deepcopy(cached)
+
+            try:
+                selection = engine.compute_lab_queue(
+                    components=batch.components,
+                    baseline=batch.baseline,
+                    sample_ids=batch.sample_ids,
+                    quota=quota,
+                )
+            except engine.ComputationError as exc:
+                raise ComputationFailed(str(exc)) from exc
+
+            selected_count = len(selection["queue"])
+            if selected_count < quota:
+                message = (
+                    f"当前仅有 {selection['candidate_count']} 份未化验布样，"
+                    f"本次名额 {quota} 只能选出 {selected_count} 份。"
+                )
+            else:
+                message = (
+                    f"按材质概率不确定度选出 {selected_count} 份未化验布样，"
+                    f"覆盖 {selection['covered_component_count']} 个连通分量。"
+                )
+
+            result = {
+                "batch_id": batch.batch_id,
+                "version": version,
+                "quota": quota,
+                "selected_count": selected_count,
+                "unlabelled_count": selection["candidate_count"],
+                "component_count": selection["component_count"],
+                "covered_component_count": selection["covered_component_count"],
+                "sample_ids": [
+                    item["sample_id"] for item in selection["queue"]
+                ],
+                "samples": selection["queue"],
+                "message": message,
+            }
+            batch.lab_queues[key] = result
+            return copy.deepcopy(result)
 
     def clear(self) -> None:
         with self._lock:

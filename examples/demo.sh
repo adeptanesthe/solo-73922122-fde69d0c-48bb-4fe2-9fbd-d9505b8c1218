@@ -26,10 +26,33 @@ echo "== review: which lab conclusion matters most =="
 curl -sS "$BASE_URL/batches/$BATCH_ID/review" | tee /tmp/batch-review.json
 echo
 
+echo "== proactive lab queue, quota 2 (version 1) =="
+curl -sS -X POST "$BASE_URL/batches/$BATCH_ID/lab-queue" \
+  -H 'Content-Type: application/json' \
+  --data '{"version": 1, "quota": 2}' | tee /tmp/batch-queue.json
+echo
+
+echo "== same version and quota is an idempotent retry =="
+curl -sS -X POST "$BASE_URL/batches/$BATCH_ID/lab-queue" \
+  -H 'Content-Type: application/json' \
+  --data '{"version": 1, "quota": 2}' | tee /tmp/batch-queue-retry.json
+echo
+cmp -s /tmp/batch-queue.json /tmp/batch-queue-retry.json \
+  && echo "identical queue" \
+  || { echo "queues differ!"; exit 1; }
+
 echo "== replace sample 3 conclusion (version 1 -> 2) =="
 curl -sS -X PUT "$BASE_URL/batches/$BATCH_ID/samples/3/label" \
   -H 'Content-Type: application/json' \
   --data '{"material": "棉", "version": 1}' | tee /tmp/batch-update.json
+echo
+
+echo "== a queue request carrying the old version is rejected with 409 =="
+curl -sS -o /tmp/batch-queue-conflict.json -w 'HTTP %{http_code}\n' \
+  -X POST "$BASE_URL/batches/$BATCH_ID/lab-queue" \
+  -H 'Content-Type: application/json' \
+  --data '{"version": 1, "quota": 2}'
+cat /tmp/batch-queue-conflict.json
 echo
 
 echo "== stale version is rejected with 409 =="
@@ -44,4 +67,10 @@ echo
 
 echo "== review again reflects the new version =="
 curl -sS "$BASE_URL/batches/$BATCH_ID/review"
+echo
+
+echo "== lab queue reflects the new version and label set =="
+curl -sS -X POST "$BASE_URL/batches/$BATCH_ID/lab-queue" \
+  -H 'Content-Type: application/json' \
+  --data '{"version": 3, "quota": 2}'
 echo

@@ -235,6 +235,139 @@ def compute_component_recommendations(
     return _solve_component(adjacency, component, labels_by_index)
 
 
+def _probability(value: float) -> float:
+    rounded = round(float(value), 12)
+    return 0.0 if rounded == 0.0 else rounded
+
+
+def material_uncertainty(recommendation: Recommendation) -> float:
+    """Return ``1 - max(probability)`` for an unlabelled sample.
+
+    A sample whose component has no reachable lab point has no probability
+    distribution at all; its uncertainty is defined as 1.0 so that it ranks
+    as the least certain material assignment.
+    """
+
+    if not recommendation.probabilities:
+        return 1.0
+    highest = max(recommendation.probabilities.values())
+    return min(1.0, max(0.0, 1.0 - float(highest)))
+
+
+def _selection_key(uncertainty: float, sample_id: int) -> tuple[float, int]:
+    # Rounding makes mathematically tied uncertainties compare equal even if
+    # the solver produced last-bit differences; ties fall back to sample id.
+    return (-round(float(uncertainty), 12), int(sample_id))
+
+
+def compute_lab_queue(
+    components: Sequence[np.ndarray],
+    baseline: Mapping[int, Recommendation],
+    sample_ids: Sequence[int],
+    quota: int,
+) -> dict:
+    """Select unlabelled samples for proactive lab testing.
+
+    Selection has two phases:
+
+    1. Every connected component that has at least one unlabelled sample gets
+       one sample (when the quota allows it).  Components are visited by their
+       best candidate first, so a quota smaller than the component count still
+       favours the least certain components.
+    2. The remaining slots are filled globally by uncertainty descending and
+       sample id ascending.
+
+    The result is deterministic for a fixed graph, label set and quota.  The
+    queue never contains duplicates and never exceeds either the quota or the
+    number of unlabelled samples.
+    """
+
+    if quota < 1:
+        raise ComputationError("送检名额必须为正整数")
+
+    component_of: dict[int, int] = {}
+    for component_index, component in enumerate(components):
+        for node in component:
+            component_of[int(node)] = component_index
+
+    candidates: list[dict] = []
+    for node, recommendation in baseline.items():
+        if node not in component_of:
+            raise ComputationError("未化验布样不在任何连通分量中")
+        sample_id = int(sample_ids[node])
+        uncertainty = material_uncertainty(recommendation)
+        candidates.append(
+            {
+                "node": int(node),
+                "sample_id": sample_id,
+                "uncertainty": uncertainty,
+                "component_index": component_of[node],
+                "recommendation": recommendation,
+            }
+        )
+
+    by_component: dict[int, list[dict]] = {}
+    for candidate in candidates:
+        by_component.setdefault(candidate["component_index"], []).append(candidate)
+
+    for group in by_component.values():
+        group.sort(
+            key=lambda item: _selection_key(item["uncertainty"], item["sample_id"])
+        )
+
+    component_order = sorted(
+        by_component,
+        key=lambda component_index: _selection_key(
+            by_component[component_index][0]["uncertainty"],
+            by_component[component_index][0]["sample_id"],
+        ),
+    )
+
+    selected: list[dict] = []
+    selected_nodes: set[int] = set()
+
+    for component_index in component_order:
+        if len(selected) >= quota:
+            break
+        candidate = by_component[component_index][0]
+        selected.append(candidate)
+        selected_nodes.add(candidate["node"])
+
+    remaining = sorted(
+        (candidate for candidate in candidates if candidate["node"] not in selected_nodes),
+        key=lambda item: _selection_key(item["uncertainty"], item["sample_id"]),
+    )
+    for candidate in remaining:
+        if len(selected) >= quota:
+            break
+        selected.append(candidate)
+
+    queue: list[dict] = []
+    for position, candidate in enumerate(selected, start=1):
+        recommendation = candidate["recommendation"]
+        queue.append(
+            {
+                "position": position,
+                "sample_id": candidate["sample_id"],
+                "component_index": candidate["component_index"],
+                "uncertainty": _probability(candidate["uncertainty"]),
+                "probabilities": {
+                    material: _probability(value)
+                    for material, value in recommendation.probabilities.items()
+                },
+            }
+        )
+
+    return {
+        "queue": queue,
+        "candidate_count": len(candidates),
+        "component_count": len(by_component),
+        "covered_component_count": len(
+            {candidate["component_index"] for candidate in selected}
+        ),
+    }
+
+
 def _destination(recommendation: Recommendation) -> dict:
     """Serialise one recommendation as an operator-facing destination."""
 

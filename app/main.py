@@ -7,7 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .models import BatchCreateIn, LabelUpdateIn
+from .models import BatchCreateIn, LabQueueIn, LabelUpdateIn
 from .store import StoreError, store
 
 app = FastAPI(
@@ -97,3 +97,19 @@ def review_batch(batch_id: str) -> dict:
     """
 
     return store.record_review(batch_id)
+
+
+@app.post("/batches/{batch_id}/lab-queue", tags=["lab-queue"])
+def create_lab_queue(batch_id: str, payload: LabQueueIn) -> dict:
+    """Build a proactive lab-testing queue for the submitted batch version.
+
+    Unlabelled samples are ranked by material uncertainty
+    (``1 - max(probability)``; 1.0 when no lab point is reachable).  Each
+    component with a candidate receives one slot first, then the remaining
+    slots are filled by uncertainty descending and sample id ascending.
+
+    Retrying the same ``(version, quota)`` returns the identical queue, while
+    a request carrying an older version returns ``409 version_conflict``.
+    """
+
+    return store.request_lab_queue(batch_id, payload.version, payload.quota)

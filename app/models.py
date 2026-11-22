@@ -5,9 +5,17 @@ from __future__ import annotations
 import math
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 MAX_SAMPLES = 100
+MAX_LAB_QUEUE = 10
 SAMPLE_ID_DESCRIPTION = "布样整数编号，批次内唯一"
 
 
@@ -105,6 +113,18 @@ class LabelUpdateIn(BaseModel):
         if not cleaned:
             raise ValueError("材质名称不能为空白")
         return cleaned
+
+
+class LabQueueIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(ge=1, description="提交时看到的批次版号")
+    quota: int = Field(
+        ge=1,
+        le=MAX_LAB_QUEUE,
+        validation_alias=AliasChoices("quota", "count"),
+        description=f"本次主动送检名额，1–{MAX_LAB_QUEUE}",
+    )
 
 
 class ErrorBody(BaseModel):

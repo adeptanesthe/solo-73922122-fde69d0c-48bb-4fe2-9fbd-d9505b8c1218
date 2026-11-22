@@ -100,3 +100,76 @@ def test_symmetric_material_tie_stays_pending():
     assert item.material is None
     assert item.probabilities["zeta"] == pytest.approx(0.5)
     assert item.probabilities["alpha"] == pytest.approx(0.5)
+
+
+def _queue_fixture():
+    """Three components: [0..3] two labels, [4..5] label-free, [6..7] labels.
+
+    Node 1 (2/3, 1/3) and node 2 (1/3, 2/3) both have uncertainty 1/3, so
+    sample-id order decides between them.  Nodes 4 and 5 are unreachable and
+    therefore have uncertainty 1.0.  Node 7 is certain (uncertainty 0).
+    """
+
+    adjacency = np.zeros((8, 8), dtype=bool)
+    for left, right in [(0, 1), (1, 2), (2, 3), (4, 5), (6, 7)]:
+        adjacency[left, right] = adjacency[right, left] = True
+    components = engine.find_components(adjacency)
+    labels = {0: "red", 3: "blue", 6: "red"}
+    recommendations = engine.compute_recommendations(adjacency, components, labels)
+    return adjacency, components, recommendations, list(range(1, 9))
+
+
+def test_material_uncertainty_uses_one_minus_highest_probability():
+    _, _, recommendations, _ = _queue_fixture()
+    assert engine.material_uncertainty(recommendations[1]) == pytest.approx(1 / 3)
+    assert engine.material_uncertainty(recommendations[2]) == pytest.approx(1 / 3)
+    # No reachable lab point: defined as fully uncertain.
+    assert engine.material_uncertainty(recommendations[4]) == 1.0
+    # A certain sample contributes no uncertainty.
+    assert engine.material_uncertainty(recommendations[7]) == 0.0
+
+
+def test_lab_queue_covers_each_component_before_filling_by_uncertainty():
+    _, components, recommendations, sample_ids = _queue_fixture()
+
+    one = engine.compute_lab_queue(components, recommendations, sample_ids, 1)
+    # Only one slot: the most uncertain component's best candidate wins.
+    assert [item["sample_id"] for item in one["queue"]] == [5]
+
+    two = engine.compute_lab_queue(components, recommendations, sample_ids, 2)
+    # Second slot goes to the next unrepresented component, not to node 4
+    # (uncertainty 1.0) in the component already covered.
+    assert [item["sample_id"] for item in two["queue"]] == [5, 2]
+
+    three = engine.compute_lab_queue(components, recommendations, sample_ids, 3)
+    assert [item["sample_id"] for item in three["queue"]] == [5, 2, 8]
+    assert three["covered_component_count"] == 3
+
+    four = engine.compute_lab_queue(components, recommendations, sample_ids, 4)
+    # All components covered; the spare slot goes to the most uncertain
+    # remaining sample (node 4, uncertainty 1.0).
+    assert [item["sample_id"] for item in four["queue"]] == [5, 2, 8, 6]
+
+
+def test_lab_queue_breaks_uncertainty_ties_by_sample_id():
+    _, components, recommendations, sample_ids = _queue_fixture()
+    result = engine.compute_lab_queue(components, recommendations, sample_ids, 5)
+    queue = [item["sample_id"] for item in result["queue"]]
+    # Nodes 2 and 3 tie at uncertainty 1/3; node 2 has the smaller id.
+    assert queue.index(2) < queue.index(3)
+    assert result["candidate_count"] == 5
+    assert len(set(queue)) == len(queue) == 5
+
+
+def test_lab_queue_never_exceeds_candidate_count():
+    _, components, recommendations, sample_ids = _queue_fixture()
+    result = engine.compute_lab_queue(components, recommendations, sample_ids, 10)
+    assert len(result["queue"]) == 5
+    assert result["component_count"] == 3
+
+
+def test_lab_queue_is_deterministic_for_fixed_input():
+    _, components, recommendations, sample_ids = _queue_fixture()
+    first = engine.compute_lab_queue(components, recommendations, sample_ids, 4)
+    second = engine.compute_lab_queue(components, recommendations, sample_ids, 4)
+    assert first == second

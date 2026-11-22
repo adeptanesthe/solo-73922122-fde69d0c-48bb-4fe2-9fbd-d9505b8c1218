@@ -463,3 +463,332 @@ def test_version_must_be_positive(client):
     _create(client, labels=[{"sample_id": 1, "material": "cotton"}])
     response = client.delete("/batches/B-1/samples/1/label", params={"version": 0})
     assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Proactive lab queue
+# ---------------------------------------------------------------------------
+
+# Three components with a threshold of 0.04:
+#   [1,2,3,4] chain with cotton (1) and wool (4) labels,
+#   [5,6]     chain without any lab point,
+#   [7,8]     chain with a cotton label on 7.
+# Uncertainties: 2 and 3 both 1/3, 5 and 6 both 1.0, 8 is 0.0.
+QUEUE_SAMPLES = [
+    {"id": 1, "vector": _unit(0)},
+    {"id": 2, "vector": _unit(2)},
+    {"id": 3, "vector": _unit(4)},
+    {"id": 4, "vector": _unit(6)},
+    {"id": 5, "vector": _unit(90)},
+    {"id": 6, "vector": _unit(92)},
+    {"id": 7, "vector": _unit(180)},
+    {"id": 8, "vector": _unit(182)},
+]
+
+
+def _create_queue_batch(client: TestClient, batch_id: str = "Q-1") -> dict:
+    payload = {
+        "batch_id": batch_id,
+        "threshold": 0.04,
+        "samples": QUEUE_SAMPLES,
+        "labels": [
+            {"sample_id": 1, "material": "cotton"},
+            {"sample_id": 4, "material": "wool"},
+            {"sample_id": 7, "material": "cotton"},
+        ],
+    }
+    response = client.post("/batches", json=payload)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def _queue(client: TestClient, batch_id: str, version: int, quota: int) -> dict:
+    return client.post(
+        f"/batches/{batch_id}/lab-queue",
+        json={"version": version, "quota": quota},
+    )
+
+
+def test_lab_queue_returns_version_bound_selection(client):
+    body = _create_queue_batch(client)
+    response = _queue(client, "Q-1", body["version"], 3)
+    assert response.status_code == 200, response.text
+    result = response.json()
+
+    assert result["batch_id"] == "Q-1"
+    assert result["version"] == 1
+    assert result["quota"] == 3
+    assert result["selected_count"] == 3
+    assert result["unlabelled_count"] == 5
+    assert result["component_count"] == 3
+    assert result["covered_component_count"] == 3
+    # One slot per component first: 5 (label-free), 2 (lowest id among the
+    # 1/3 ties), then 8 (certain but the only unlabelled sample in its
+    # component).  Node 6 stays out because node 5 already covers it.
+    assert result["sample_ids"] == [5, 2, 8]
+    assert [item["position"] for item in result["samples"]] == [1, 2, 3]
+    assert result["samples"][0]["uncertainty"] == 1.0
+    assert result["samples"][0]["probabilities"] == {}
+    assert result["samples"][1]["uncertainty"] == pytest.approx(1 / 3)
+    assert result["samples"][1]["probabilities"] == {
+        "cotton": pytest.approx(0.666666666667),
+        "wool": pytest.approx(0.333333333333),
+    }
+    assert result["samples"][2]["uncertainty"] == 0.0
+
+
+def test_lab_queue_fills_remaining_slots_by_uncertainty_then_id(client):
+    _create_queue_batch(client)
+    result = _queue(client, "Q-1", 1, 5).json()
+    # After one sample per component, the spare slots go to node 6 (1.0)
+    # then node 3 (1/3, tied with node 2 which is already queued).
+    assert result["sample_ids"] == [5, 2, 8, 6, 3]
+    assert result["selected_count"] == 5
+
+
+def test_lab_queue_same_version_and_quota_is_idempotent(client):
+    _create_queue_batch(client)
+    first = _queue(client, "Q-1", 1, 4)
+    second = _queue(client, "Q-1", 1, 4)
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+    # Same version but a different quota is a different selection request.
+    other = _queue(client, "Q-1", 1, 2).json()
+    assert other["sample_ids"] == [5, 2]
+    assert other["quota"] == 2
+
+
+def test_lab_queue_rejects_stale_version(client):
+    _create_queue_batch(client)
+    updated = client.put(
+        "/batches/Q-1/samples/2/label",
+        json={"material": "cotton", "version": 1},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["version"] == 2
+
+    stale = _queue(client, "Q-1", 1, 2)
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "version_conflict"
+    assert stale.json()["error"]["details"] == {
+        "submitted_version": 1,
+        "current_version": 2,
+    }
+
+    fresh = _queue(client, "Q-1", 2, 2)
+    assert fresh.status_code == 200
+    assert fresh.json()["version"] == 2
+    # Sample 2 is now labelled and must not be queued any more.
+    assert 2 not in fresh.json()["sample_ids"]
+
+
+def test_lab_queue_cache_is_invalidated_by_label_change(client):
+    _create_queue_batch(client)
+    before = _queue(client, "Q-1", 1, 3).json()
+    assert before["sample_ids"] == [5, 2, 8]
+
+    changed = client.put(
+        "/batches/Q-1/samples/2/label",
+        json={"material": "cotton", "version": 1},
+    )
+    assert changed.status_code == 200
+    assert changed.json()["version"] == 2
+
+    after = _queue(client, "Q-1", 2, 3).json()
+    assert after["sample_ids"] != before["sample_ids"]
+    assert 2 not in after["sample_ids"]
+    assert 3 in after["sample_ids"]
+
+
+def test_lab_queue_cache_is_invalidated_by_label_withdrawal(client):
+    _create_queue_batch(client)
+    before = _queue(client, "Q-1", 1, 2).json()
+    assert before["sample_ids"] == [5, 2]
+
+    removed = client.delete("/batches/Q-1/samples/7/label", params={"version": 1})
+    assert removed.status_code == 200
+    assert removed.json()["version"] == 2
+
+    after = _queue(client, "Q-1", 2, 2).json()
+    # The whole [7, 8] component became label-free, turning both samples into
+    # uncertainty-1.0 candidates; sample 7 is unlabelled now as well.  The two
+    # components tie at 1.0, so the smaller component representative wins.
+    assert after["sample_ids"] == [5, 7]
+    assert 7 not in before["sample_ids"]
+
+
+def test_lab_queue_records_review_and_queue_together_in_snapshot(client):
+    _create_queue_batch(client)
+    first_queue = _queue(client, "Q-1", 1, 2).json()
+    first_review = client.get("/batches/Q-1/review").json()
+
+    updated = client.put(
+        "/batches/Q-1/samples/8/label",
+        json={"material": "wool", "version": 1},
+    ).json()
+    assert updated["version"] == 2
+
+    # Neither cached artefact may be served after the label change.
+    second_review = client.get("/batches/Q-1/review").json()
+    assert second_review["version"] == 2
+    second_queue = _queue(client, "Q-1", 2, 2).json()
+    assert second_queue["version"] == 2
+    # Sample 8 is labelled now, so its component's representative changes to
+    # the next candidate (none left -> the component stops contributing).
+    assert first_queue["sample_ids"] == [5, 2]
+    assert second_queue["sample_ids"] == [5, 2]
+    assert first_review["version"] == 1
+
+
+def test_lab_queue_validation(client):
+    _create_queue_batch(client)
+    # Quota bounds are inclusive 1..10.
+    assert _queue(client, "Q-1", 1, 0).status_code == 422
+    assert _queue(client, "Q-1", 1, 11).status_code == 422
+    assert _queue(client, "Q-1", 0, 1).status_code == 422
+    # Missing fields are rejected with the shared validation error envelope.
+    missing = client.post("/batches/Q-1/lab-queue", json={"version": 1})
+    assert missing.status_code == 422
+    assert missing.json()["error"]["code"] == "validation_error"
+    # Unknown batch is a 404.
+    assert _queue(client, "missing", 1, 1).status_code == 404
+    assert _queue(client, "missing", 1, 1).json()["error"]["code"] == "batch_not_found"
+
+
+def test_lab_queue_failed_computation_keeps_state(client, monkeypatch):
+    body = _create_queue_batch(client)
+
+    def _boom(*_args, **_kwargs):
+        from app import engine
+
+        raise engine.ComputationError("simulated queue failure")
+
+    monkeypatch.setattr("app.store.engine.compute_lab_queue", _boom)
+    response = _queue(client, "Q-1", 1, 2)
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "computation_failed"
+    # A failed selection must not cache a result nor bump the version.
+    assert store.get("Q-1").version == body["version"]
+    assert store.get("Q-1").lab_queues == {}
+    monkeypatch.undo()
+
+    retried = _queue(client, "Q-1", 1, 2)
+    assert retried.status_code == 200
+    assert retried.json()["selected_count"] == 2
+
+
+def test_lab_queue_failed_recomputation_does_not_strand_a_stale_queue(client, monkeypatch):
+    _create_queue_batch(client)
+    first = _queue(client, "Q-1", 1, 2).json()
+
+    def _boom(*_args, **_kwargs):
+        from app import engine
+
+        raise engine.ComputationError("simulated solver failure")
+
+    monkeypatch.setattr("app.store.engine.compute_recommendations", _boom)
+    failed = client.put(
+        "/batches/Q-1/samples/2/label",
+        json={"material": "wool", "version": 1},
+    )
+    assert failed.status_code == 500
+    monkeypatch.undo()
+
+    # Because the label write rolled back, the old (version, quota) queue is
+    # still the correct queue for the unchanged state.
+    assert store.get("Q-1").version == 1
+    assert _queue(client, "Q-1", 1, 2).json() == first
+
+
+def test_lab_queue_concurrent_retries_are_identical_and_bounded(client):
+    import threading
+
+    _create_queue_batch(client)
+    responses: list[dict] = []
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(8)
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=5)
+            response = _queue(client, "Q-1", 1, 4)
+            responses.append(response.json())
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors
+    assert len(responses) == 8
+    first = responses[0]
+    assert first["version"] == 1
+    assert len(first["sample_ids"]) == 4 == len(set(first["sample_ids"]))
+    assert all(response == first for response in responses)
+
+
+def test_lab_queue_concurrent_requests_with_mixed_versions_never_exceed_quota(client):
+    import threading
+
+    _create_queue_batch(client)
+    results: list[tuple[int, dict]] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(6)
+
+    def worker(index: int) -> None:
+        barrier.wait(timeout=5)
+        response = _queue(client, "Q-1", 1, 3)
+        with lock:
+            results.append((response.status_code, response.json()))
+
+    threads = [threading.Thread(target=worker, args=(index,)) for index in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert len(results) == 6
+    for status, body in results:
+        assert status == 200
+        assert body["quota"] == 3
+        assert body["selected_count"] == 3
+        assert len(set(body["sample_ids"])) == 3
+    assert len({tuple(body["sample_ids"]) for _, body in results}) == 1
+
+
+def test_lab_queue_truncates_when_quota_exceeds_candidates(client):
+    _create_queue_batch(client)
+    result = _queue(client, "Q-1", 1, 10).json()
+    # Five unlabelled samples exist; the endpoint never invents extra slots.
+    assert result["selected_count"] == 5
+    assert result["quota"] == 10
+    assert result["sample_ids"] == [5, 2, 8, 6, 3]
+    assert "只能选出 5 份" in result["message"]
+
+
+def test_lab_queue_with_no_unlabelled_samples_is_empty(client):
+    payload = {
+        "batch_id": "Q-FULL",
+        "threshold": 0.2,
+        "samples": [
+            {"id": 1, "vector": _unit(0)},
+            {"id": 2, "vector": _unit(5)},
+        ],
+        "labels": [
+            {"sample_id": 1, "material": "cotton"},
+            {"sample_id": 2, "material": "wool"},
+        ],
+    }
+    assert client.post("/batches", json=payload).status_code == 201
+    response = _queue(client, "Q-FULL", 1, 3)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_count"] == 0
+    assert body["sample_ids"] == []
+    assert body["samples"] == []
+    assert body["covered_component_count"] == 0
+    # The empty queue is still cached and idempotent.
+    assert _queue(client, "Q-FULL", 1, 3).json() == body
